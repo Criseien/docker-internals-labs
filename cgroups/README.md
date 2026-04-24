@@ -1,230 +1,96 @@
-# cgroups — Control Groups
+# cgroups — Resource enforcement on the node (what `resources.limits` actually writes)
 
-## Scenario
-
-A process is consuming too much CPU and memory on a shared node, affecting
-other workloads. No container runtime available — you need to limit it
-manually using cgroups directly.
-
-Your job: create a cgroup, set CPU and memory limits, attach the process,
-verify the limits are enforced, and freeze it without killing it.
+cgroups v2 is the kernel interface that enforces CPU and memory limits on any
+process group — with or without a container runtime. Every `resources.limits.cpu`
+and `resources.limits.memory` in a pod spec maps directly to `cpu.max` and
+`memory.max` files under `/sys/fs/cgroup/kubepods/`. When a container is
+OOM-killed in K8s, the kubelet reads that event from `memory.events` in the
+same hierarchy you manipulate here.
 
 ---
 
-## cgroups v2 — AlmaLinux 9
+## The 5 Problems You'll Actually Hit
 
-AlmaLinux 9 uses cgroups v2 (unified hierarchy). One tree, one interface.
+### 1. `cpu.max` written but CPU still maxes out — controllers not enabled
 
-```bash
-# Verify cgroups v2 is active
-mount | grep cgroup
-# cgroup2 on /sys/fs/cgroup type cgroup2 ...   ← v2 confirmed
-
-# v1 would show multiple mounts like:
-# cgroup on /sys/fs/cgroup/cpu type cgroup ...
-# cgroup on /sys/fs/cgroup/memory type cgroup ...
-```
-
-In v2, all controllers live under `/sys/fs/cgroup/`. You create a subdirectory
-and write to its interface files to configure limits.
-
----
-
-## How to Build a cgroup Manually
-
-### Step 1 — Create the cgroup directory
+**When it happens:** You create a cgroup directory and try to write `cpu.max`
+immediately. The file doesn't exist.
 
 ```bash
 mkdir /sys/fs/cgroup/myapp
-ls /sys/fs/cgroup/myapp
-# cgroup.controllers  cgroup.events  cgroup.freeze  cgroup.max.depth
-# cgroup.procs        cpu.max        memory.max     memory.current
-# ...
+echo "50000 100000" > /sys/fs/cgroup/myapp/cpu.max
+# bash: /sys/fs/cgroup/myapp/cpu.max: No such file or directory
 ```
 
-The kernel populates the directory automatically with interface files.
-
----
-
-### Step 2 — Enable controllers
-
-Controllers (cpu, memory, io) must be enabled in the parent cgroup before
-a child cgroup can use them.
+**Root cause:** In cgroups v2, controllers must be explicitly enabled in the
+parent before child cgroups inherit them.
 
 ```bash
-# Check which controllers are available
+# Check what's available at the root
 cat /sys/fs/cgroup/cgroup.controllers
 # cpuset cpu io memory hugetlb pids rdma misc
 
-# Enable cpu and memory for children
+# What's enabled for children right now
+cat /sys/fs/cgroup/cgroup.subtree_control
+# (empty — nothing enabled by default)
+```
+
+**Fix:**
+
+```bash
 echo "+cpu +memory" > /sys/fs/cgroup/cgroup.subtree_control
 
-# Verify the child cgroup has them
+# Now the interface files exist
 cat /sys/fs/cgroup/myapp/cgroup.controllers
 # cpu memory
 ```
 
 ---
 
-### Step 3 — Set CPU limit
+### 2. Process can't be moved to cgroup — systemd or Docker moves it back
 
-`cpu.max` format: `quota period` — the process can use `quota` microseconds
-every `period` microseconds.
-
-```bash
-# Limit to 50% of one CPU (50000 out of 100000 microseconds)
-echo "50000 100000" > /sys/fs/cgroup/myapp/cpu.max
-
-# Limit to 200% (2 full CPUs)
-echo "200000 100000" > /sys/fs/cgroup/myapp/cpu.max
-
-# No limit (default)
-echo "max 100000" > /sys/fs/cgroup/myapp/cpu.max
-
-# Verify
-cat /sys/fs/cgroup/myapp/cpu.max
-# 50000 100000
-```
-
----
-
-### Step 4 — Set memory limit
-
-```bash
-# Limit to 256MB
-echo $((256 * 1024 * 1024)) > /sys/fs/cgroup/myapp/memory.max
-# or
-echo "268435456" > /sys/fs/cgroup/myapp/memory.max
-
-# Check current usage
-cat /sys/fs/cgroup/myapp/memory.current
-# 0   ← no processes attached yet
-
-# Verify limit
-cat /sys/fs/cgroup/myapp/memory.max
-# 268435456
-```
-
----
-
-### Step 5 — Attach a process
-
-```bash
-# Get the PID of the process you want to limit
-pidof myprocess
-# 4821
-
-# Add PID to the cgroup
-echo 4821 > /sys/fs/cgroup/myapp/cgroup.procs
-
-# Verify it's in the cgroup
-cat /sys/fs/cgroup/myapp/cgroup.procs
-# 4821
-```
-
-All child processes spawned by PID 4821 automatically join the same cgroup.
-
----
-
-### Step 6 — Freeze the cgroup
-
-Freezing suspends all processes in the cgroup without killing them. They stay
-in memory, their state is preserved, but they get no CPU time.
-
-```bash
-# Freeze
-echo 1 > /sys/fs/cgroup/myapp/cgroup.freeze
-
-# Verify — processes still exist but are suspended
-cat /sys/fs/cgroup/myapp/cgroup.freeze
-# 1
-ps aux | grep myprocess
-# D state (uninterruptible) — frozen
-
-# Unfreeze
-echo 0 > /sys/fs/cgroup/myapp/cgroup.freeze
-```
-
-Use case: freeze a runaway process during incident investigation without
-losing its state or logs.
-
----
-
-### Step 7 — Verify limits are enforced
-
-```bash
-# Run a CPU stress test inside the cgroup
-# Start the process, get its PID, attach it, then verify CPU stays at limit
-
-# Watch CPU usage in real time
-watch -n 1 "cat /sys/fs/cgroup/myapp/cpu.stat"
-# usage_usec — total CPU time used
-# throttled_usec — time the cgroup was throttled (above limit)
-# nr_throttled — number of throttling events
-
-# Memory pressure
-cat /sys/fs/cgroup/myapp/memory.events
-# oom — times the OOM killer fired
-# oom_kill — processes killed by OOM
-```
-
----
-
-## The 90% — cgroup Failure Modes
-
-### 1. Controller not available in the cgroup
-
-**Symptom:**
-
-```bash
-echo "50000 100000" > /sys/fs/cgroup/myapp/cpu.max
-# bash: /sys/fs/cgroup/myapp/cpu.max: No such file or directory
-```
-
-The `cpu` controller was not enabled in the parent.
-
-**Fix:**
-
-```bash
-echo "+cpu +memory" > /sys/fs/cgroup/cgroup.subtree_control
-# Now cpu.max exists in child cgroups
-```
-
----
-
-### 2. PID not moving to cgroup — already in a non-root cgroup
-
-**Symptom:**
-
-```bash
-echo 4821 > /sys/fs/cgroup/myapp/cgroup.procs
-# bash: echo: write error: No such file or directory
-# or the PID appears in the file then disappears
-```
-
-A process can only be in one cgroup leaf. If it's already managed by
-systemd or Docker, it's in a different cgroup.
+**When it happens:** You write a PID to `cgroup.procs`. It appears briefly,
+then disappears.
 
 **Diagnose:**
 
 ```bash
 cat /proc/4821/cgroup
-# 0::/system.slice/myservice.service   ← already in systemd's cgroup
+# 0::/system.slice/myservice.service   ← already owned by systemd
 ```
 
-**Fix:** you can still move it, but the existing cgroup manager (systemd,
-containerd) may move it back. For persistent limits, configure them at
-the service level:
+**Root cause:** A process can only live in one leaf cgroup. If systemd or
+containerd manages the service, it reassigns the PID back to its own
+cgroup hierarchy on the next unit state change.
+
+**Fix:** Configure limits at the manager level — don't fight the manager:
 
 ```bash
+# systemd service — persistent, survives restarts
 systemctl set-property myservice.service CPUQuota=50% MemoryMax=256M
+
+# Verify it stuck
+systemctl show myservice.service | grep -E "^(CPUQuota|MemoryMax)"
+```
+
+For Docker:
+
+```bash
+docker run --cpus 0.5 --memory 256m myimage
+# Writes cpu.max and memory.max in Docker's cgroup subtree automatically
+
+# Update a running container without restart
+docker update --cpus 0.5 --memory 256m mycontainer
 ```
 
 ---
 
-### 3. OOM killer fires — process dies instead of waiting
+### 3. Process hits `memory.max` → OOM kill instead of waiting
 
-**Symptom:** process dies under memory pressure.
+**When it happens:** Memory-intensive process dies unexpectedly with no
+application-level crash. Sudden termination.
+
+**Diagnose:**
 
 ```bash
 cat /sys/fs/cgroup/myapp/memory.events
@@ -232,52 +98,116 @@ cat /sys/fs/cgroup/myapp/memory.events
 # oom_kill 1
 ```
 
-By default, when a cgroup hits `memory.max`, the OOM killer fires and kills
-the most expensive process.
+**Root cause:** CPU has a throttle mechanism — process waits for the next
+period when it exceeds quota. Memory has no equivalent. When a cgroup hits
+`memory.max`, the kernel OOM killer fires and kills the most expensive
+process in the cgroup immediately.
 
-**Fix:** set a swap limit or configure OOM behavior:
+**Fix:** Set `memory.max` with headroom, or add a swap buffer before OOM fires:
 
 ```bash
-# Allow some swap before OOM
 echo $((512 * 1024 * 1024)) > /sys/fs/cgroup/myapp/memory.swap.max
 ```
 
+**Trap:** `memory.current` shows live usage but takes a moment to update after
+attaching a process. Don't read it immediately after `echo <pid> > cgroup.procs`.
+
 ---
 
-### 4. Limits disappear after reboot
+### 4. Cgroup limits disappear after reboot
 
-**Symptom:** cgroup directory and limits are gone after restart.
+**When it happens:** Limits set directly in `/sys/fs/cgroup/` work fine, but
+they're gone after the next reboot.
 
-`/sys/fs/cgroup/` is a virtual filesystem in memory — everything written
-there is lost on reboot. For persistent limits, use systemd:
+**Root cause:** `/sys/fs/cgroup/` is a virtual filesystem in memory (type
+`cgroup2`). It is rebuilt from scratch by the kernel at boot. Nothing written
+there persists.
+
+**Fix:** Persist via systemd:
 
 ```bash
-# Persistent CPU and memory limits for a service
+# --runtime=false writes a drop-in file, not just a runtime change
 systemctl set-property myservice.service CPUQuota=50% MemoryMax=256M --runtime=false
 
-# Verify
-systemctl show myservice.service | grep -E "CPU|Memory"
+# Verify the drop-in file was written to disk
+cat /etc/systemd/system/myservice.service.d/50-CPUQuota.conf
 ```
 
 ---
 
-## Key Commands
+### 5. `cgroup.freeze` written but process looks alive in `ps`
+
+**When it happens:** You freeze a runaway process but `ps aux` still shows it
+running. You think the freeze didn't work.
+
+**Diagnose:**
 
 ```bash
-# Inspect
-mount | grep cgroup                           # verify v2
-cat /sys/fs/cgroup/cgroup.controllers         # available controllers
-cat /proc/<pid>/cgroup                        # which cgroup a process is in
+cat /sys/fs/cgroup/myapp/cgroup.freeze
+# 1
 
-# Build
+ps aux | grep myprocess
+# myprocess  D  ← D state (uninterruptible sleep) — this IS frozen
+```
+
+**Root cause:** Frozen processes enter uninterruptible sleep (D state). `ps`
+still shows them — they exist in memory with their state intact, but they
+receive zero CPU time. This is correct behavior.
+
+**Use case:** Freeze a runaway process during an incident to stop the damage
+without losing its memory state, open file handles, or log context.
+
+```bash
+# Freeze
+echo 1 > /sys/fs/cgroup/myapp/cgroup.freeze
+
+# Investigate safely — process is suspended, not dead
+cat /proc/<pid>/fd | wc -l    # open file descriptors still intact
+cat /proc/<pid>/status         # full process state readable
+
+# Resume
+echo 0 > /sys/fs/cgroup/myapp/cgroup.freeze
+```
+
+---
+
+## Decision: raw cgroup vs systemd properties vs Docker flags
+
+Use **Docker flags** (`--cpus`, `--memory`) for containerized workloads — Docker
+writes to the correct cgroup path and limits survive container restarts.
+`docker update` changes limits without a restart.
+
+Use **systemd properties** (`systemctl set-property`) for system services.
+Persistent across reboots. Never write directly to the cgroup of a systemd
+service — systemd will overwrite it on the next reload.
+
+Use **raw cgroup interfaces** only when the process is not managed by any
+runtime: an ad-hoc script, a one-off process, or when you need to freeze a
+runaway process during an incident without killing it.
+
+The rule: whoever started the process owns its cgroup. Writing directly into
+another manager's cgroup is a race you'll lose.
+
+---
+
+## Quick Reference
+
+```bash
+# Verify cgroups v2
+mount | grep cgroup
+# cgroup2 on /sys/fs/cgroup type cgroup2 ...
+
+# Setup
 mkdir /sys/fs/cgroup/myapp
 echo "+cpu +memory" > /sys/fs/cgroup/cgroup.subtree_control
 
 # Limits
 echo "50000 100000" > /sys/fs/cgroup/myapp/cpu.max    # 50% of 1 CPU
 echo "268435456"    > /sys/fs/cgroup/myapp/memory.max  # 256MB
+# cpu.max format: <quota_usec> <period_usec>
+# 50000/100000 = 50%  |  200000/100000 = 2 CPUs  |  "max 100000" = unlimited
 
-# Attach
+# Attach process
 echo <pid> > /sys/fs/cgroup/myapp/cgroup.procs
 
 # Freeze / unfreeze
@@ -285,30 +215,30 @@ echo 1 > /sys/fs/cgroup/myapp/cgroup.freeze
 echo 0 > /sys/fs/cgroup/myapp/cgroup.freeze
 
 # Monitor
-cat /sys/fs/cgroup/myapp/cpu.stat
-cat /sys/fs/cgroup/myapp/memory.current
-cat /sys/fs/cgroup/myapp/memory.events
+cat /sys/fs/cgroup/myapp/cpu.stat          # throttled_usec, nr_throttled
+cat /sys/fs/cgroup/myapp/memory.current    # live usage in bytes
+cat /sys/fs/cgroup/myapp/memory.events     # oom, oom_kill counts
 
-# Persistent (systemd)
+# Which cgroup is a process in?
+cat /proc/<pid>/cgroup
+
+# Persistent via systemd
 systemctl set-property <service> CPUQuota=50% MemoryMax=256M
 ```
 
+---
+
 ## K8s Connection
 
-Every pod's resource limits (`resources.limits.cpu` and `resources.limits.memory`
-in the pod spec) map directly to cgroup files on the node. Kubernetes creates
-a cgroup hierarchy under `/sys/fs/cgroup/kubepods/` — one cgroup per pod,
-one per container.
-
 ```bash
-# On a K8s node — find a pod's cgroup
+# Find a pod's cgroup on the node
 systemd-cgls | grep <pod-uid>
 cat /sys/fs/cgroup/kubepods/burstable/<pod-uid>/cpu.max
 ```
 
-`cpu.max` corresponds to `resources.limits.cpu`. `memory.max` corresponds
-to `resources.limits.memory`. When a container is OOM-killed in K8s, the
-same `memory.events` file is what the kubelet reads to report the event.
+`resources.limits.cpu: "500m"` → `500000 1000000` in `cpu.max` (500ms per second).
+`resources.limits.memory: "256Mi"` → `268435456` in `memory.max`.
 
-`docker pause` and `kubectl` pod suspension use the same `cgroup.freeze`
-interface practiced here.
+OOM-killed container in K8s: the kubelet reads `memory.events` from the pod's
+cgroup to set `OOMKilled: true` in pod status. `docker pause` and pod
+suspension both use the `cgroup.freeze` interface practiced here.
